@@ -97,32 +97,27 @@ impl SimpleLeveledCompactionController {
         task: &SimpleLeveledCompactionTask,
         output: &[usize],
     ) -> (LsmStorageState, Vec<usize> ) {
-
-        // the max sst id is always the last element in the upper level
-        let mut next_sst_id = task.upper_level_sst_ids.last().unwrap()+1;
         let mut state = snapshot.clone();
-        let mut output = vec![];
+        let mut del = vec![];
 
-        // 1.move sst id form upper&lower level to output
+        // 1.move sst id form upper&lower level to del
         if task.upper_level.is_none() {
-            output.append(&mut state.l0_sstables);
+            del.append(&mut state.l0_sstables);
         } else {
             // upper_level means real level number, so we need to -1
-            output.append(&mut state.levels[task.upper_level.unwrap()-1].1);
+            del.append(&mut state.levels[task.upper_level.unwrap()-1].1);
         }
 
         let l0_size = state.l0_sstables.len();
 
         // lower_level means real level number, so we need to -1
-        output.append(&mut state.levels[task.lower_level-1].1);
-        // 2. add new sst id to lower level
-        for i in 0..output.len() {
-            // lower_level means real level number, so we need to -1
-            state.levels[task.lower_level-1].1.push(next_sst_id);
-            next_sst_id += 1;
-        }
+        del.append(&mut state.levels[task.lower_level-1].1);
+
+        // // 2. add new sst id to lower level
+        state.levels[task.lower_level-1].1 = output.to_vec();
+
         // deal with L0 SST gets flushed while the compactor generates new SSTs
         assert!(l0_size == state.l0_sstables.len());
-        (state, output)
+        (state, del)
     }
 }
