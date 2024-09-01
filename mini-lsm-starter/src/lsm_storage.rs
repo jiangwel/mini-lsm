@@ -5,6 +5,7 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::vec;
 
 use anyhow::{Ok, Result};
 use bytes::Bytes;
@@ -16,11 +17,14 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::iterators::{two_merge_iterator, StorageIterator};
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -300,7 +304,30 @@ impl LsmStorageInner {
                 return Ok(get_result);
             }
         }
-        Ok(get_result)
+        // 3. find in l0 sstables
+        // for table_id in state.l0_sstables.iter() {
+        //     let table = state.sstables.get(table_id).unwrap().clone();
+        //     let mut iter = SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?;
+        //     if iter.is_valid() && iter.key().raw_ref() == key && !iter.value().is_empty() {
+        //         get_result = Some(Bytes::copy_from_slice(iter.value()));
+        //         break;
+        //     }
+        // }
+        let mut l0_sst_iters = vec![];
+        for table in state.l0_sstables.iter() {
+            l0_sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                state.sstables[table].clone(),
+                KeySlice::from_slice(key),
+            )?));
+        }
+        let l0_sst_merage_iter = MergeIterator::create(l0_sst_iters);
+        if l0_sst_merage_iter.is_valid()
+            && l0_sst_merage_iter.key().raw_ref() == key
+            && !l0_sst_merage_iter.value().is_empty()
+        {
+            return Ok(Some(Bytes::copy_from_slice(l0_sst_merage_iter.value())));
+        }
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -383,16 +410,44 @@ impl LsmStorageInner {
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
         let state = self.state.read();
+        //  1. create memtable merage iterator
         let mem_iter = state.memtable.scan(_lower, _upper);
-        let mut iters = vec![Box::new(mem_iter)];
+        let mut mem_iters = vec![Box::new(mem_iter)];
 
         for imm_t in state.imm_memtables.iter() {
             let imm_iter = imm_t.scan(_lower, _upper);
-            iters.push(Box::new(imm_iter));
+            mem_iters.push(Box::new(imm_iter));
         }
 
-        let marge_iter = MergeIterator::create(iters);
-        let lsm_iter = LsmIterator::new(marge_iter);
+        let mem_merage_iter = MergeIterator::create(mem_iters);
+
+        // 2. create l0 sstable merage iterator
+        let mut table_iters = vec![];
+        for table_id in state.l0_sstables.iter() {
+            let table = state.sstables.get(table_id).unwrap().clone();
+            let iter = match _lower {
+                Bound::Included(key) => {
+                    SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?
+                }
+                Bound::Excluded(key) => {
+                    let mut iter =
+                        SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?;
+                    if iter.is_valid() && iter.key().raw_ref() == key {
+                        iter.next()?;
+                    }
+                    iter
+                }
+                Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
+            };
+
+            table_iters.push(Box::new(iter));
+        }
+        let table_merage_iter = MergeIterator::create(table_iters);
+        // 3. create two merage iterator
+        let two_merge_iterator = TwoMergeIterator::create(mem_merage_iter, table_merage_iter)?;
+        // 4. create lsm iterator
+        let lsm_iter = LsmIterator::new(two_merge_iterator, map_bound(_upper));
+
         Ok(FusedIterator::new(lsm_iter.unwrap()))
     }
 }
